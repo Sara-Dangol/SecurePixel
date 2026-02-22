@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mariadb:10.6
+    container_name: pki-steganography-db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: secure_pki_steganography
+      MYSQL_USER: stegouser
+      MYSQL_PASSWORD: stegopassword
+      MYSQL_ROOT_HOST: '%'
+    ports:
+      - "3307:3306"  # Use different port to avoid conflicts with local MySQL
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - stego-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    restart: unless-stopped
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: pki-steganography-phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: stegouser
+      PMA_PASSWORD: stegopassword
+      UPLOAD_LIMIT: 100M
+    ports:
+      - "8080:80"
+    networks:
+      - stego-network
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: pki-steganography-app
+    environment:
+      - DISPLAY=${DISPLAY}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=stegouser
+      - DB_PASSWORD=stegopassword
+      - DB_NAME=secure_pki_steganography
+      - XAUTHORITY=/tmp/.docker.xauth
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./shared:/home/appuser/shared:rw
+    networks:
+      - stego-network
+    depends_on:
+      mysql:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    ipc: host
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+
+networks:
+  stego-network:
+    driver: bridge
+    

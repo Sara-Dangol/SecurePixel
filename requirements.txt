@@ -1,0 +1,13 @@
+# Core cryptography
+bcrypt==4.0.1
+pycryptodome==3.19.0
+
+# Image processing
+Pillow==10.1.0
+numpy==1.24.3
+
+# Database
+mysql-connector-python==8.1.0
+
+# Date handling
+python-dateutil==2.8.2
