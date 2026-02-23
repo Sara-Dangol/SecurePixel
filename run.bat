@@ -1,9 +1,9 @@
 @echo off
-title PKI Steganography Suite Launcher
+title SecurePixel Launcher
 color 0A
 
 echo ========================================
-echo    PKI STEGANOGRAPHY SUITE
+echo   SecurePixel
 echo    Windows Launcher
 echo ========================================
 echo.
