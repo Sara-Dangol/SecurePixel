@@ -3,7 +3,7 @@ version: '3.8'
 services:
   mysql:
     image: mariadb:10.6
-    container_name: pki-steganography-db
+    container_name: securepixel-mysql
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: secure_pki_steganography
@@ -11,12 +11,12 @@ services:
       MYSQL_PASSWORD: stegopassword
       MYSQL_ROOT_HOST: '%'
     ports:
-      - "3307:3306"  # Use different port to avoid conflicts with local MySQL
+      - "3307:3306"  # Different port to avoid conflicts
     volumes:
       - mysql_data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
-      - stego-network
+      - securepixel-network
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       timeout: 20s
@@ -25,7 +25,7 @@ services:
 
   phpmyadmin:
     image: phpmyadmin/phpmyadmin
-    container_name: pki-steganography-phpmyadmin
+    container_name: securepixel-phpmyadmin
     environment:
       PMA_HOST: mysql
       PMA_PORT: 3306
@@ -35,14 +35,16 @@ services:
     ports:
       - "8080:80"
     networks:
-      - stego-network
+      - securepixel-network
     depends_on:
       - mysql
     restart: unless-stopped
 
   app:
-    build: .
-    container_name: pki-steganography-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: securepixel-app
     environment:
       - DISPLAY=${DISPLAY}
       - DB_HOST=mysql
@@ -50,12 +52,18 @@ services:
       - DB_USER=stegouser
       - DB_PASSWORD=stegopassword
       - DB_NAME=secure_pki_steganography
-      - XAUTHORITY=/tmp/.docker.xauth
+      - PYTHONUNBUFFERED=1
     volumes:
+      # X11 for GUI
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Shared folder for file exchange
       - ./shared:/home/appuser/shared:rw
+      # Mount tests directory for running tests
+      - ./tests:/app/tests:ro
+      # Mount the app code (for development, optional)
+      - ./stegno_gui.py:/app/stegno_gui.py:ro
     networks:
-      - stego-network
+      - securepixel-network
     depends_on:
       mysql:
         condition: service_healthy
@@ -64,10 +72,35 @@ services:
     ipc: host
     restart: unless-stopped
 
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: securepixel-tests
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=stegouser
+      - DB_PASSWORD=stegopassword
+      - DB_NAME=secure_pki_steganography
+      - PYTHONPATH=/app
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./stegno_gui.py:/app/stegno_gui.py:ro
+      - ./test-reports:/app/test-reports
+    networks:
+      - securepixel-network
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["python", "-m", "unittest", "discover", "-v", "tests"]
+    profiles:
+      - tests
+
 volumes:
   mysql_data:
 
 networks:
-  stego-network:
+  securepixel-network:
     driver: bridge
     
