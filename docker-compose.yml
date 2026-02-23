@@ -41,12 +41,12 @@ services:
     restart: unless-stopped
 
   app:
-    build:
+    build: 
       context: .
       dockerfile: Dockerfile
     container_name: securepixel-app
     environment:
-      - DISPLAY=${DISPLAY}
+      - DISPLAY=host.docker.internal:0  # Windows-specific DISPLAY setting
       - DB_HOST=mysql
       - DB_PORT=3306
       - DB_USER=stegouser
@@ -54,14 +54,10 @@ services:
       - DB_NAME=secure_pki_steganography
       - PYTHONUNBUFFERED=1
     volumes:
-      # X11 for GUI
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # For GUI on Windows
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw  # This works with VcXsrv
       # Shared folder for file exchange
       - ./shared:/home/appuser/shared:rw
-      # Mount tests directory for running tests
-      - ./tests:/app/tests:ro
-      # Mount the app code (for development, optional)
-      - ./stegno_gui.py:/app/stegno_gui.py:ro
     networks:
       - securepixel-network
     depends_on:
@@ -69,9 +65,11 @@ services:
         condition: service_healthy
     stdin_open: true
     tty: true
-    ipc: host
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # For Windows GUI
 
+  # Test service (optional, run with --profile tests)
   test-runner:
     build:
       context: .
@@ -103,4 +101,3 @@ volumes:
 networks:
   securepixel-network:
     driver: bridge
-    
