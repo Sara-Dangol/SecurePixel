@@ -53,8 +53,8 @@ class CertificateAuthority:
                 'C': 'US'
             },
             'validity': {
-                'not_before': datetime.now(),
-                'not_after': datetime.now() + timedelta(days=3650)
+                'not_before': datetime.now().isoformat(),
+                'not_after': (datetime.now() + timedelta(days=3650)).isoformat()
             },
             'public_key': key.publickey().export_key().decode('utf-8'),
             'key_usage': ['keyCertSign', 'cRLSign'],
@@ -64,6 +64,9 @@ class CertificateAuthority:
         
     def issue_certificate(self, user_id, public_key, user_info):
         """Issue digital certificate to user"""
+        not_before = datetime.now()
+        not_after = datetime.now() + timedelta(days=365)
+        
         cert = {
             'version': '1.0',
             'serial': f'USR-{user_id:04d}',
@@ -75,20 +78,20 @@ class CertificateAuthority:
             },
             'issuer': self.ca_cert['subject'],
             'validity': {
-                'not_before': datetime.now(),
-                'not_after': datetime.now() + timedelta(days=365)
+                'not_before': not_before.isoformat(),
+                'not_after': not_after.isoformat()
             },
             'public_key': public_key,
             'key_usage': ['digitalSignature', 'keyEncipherment'],
-            'signature': self._sign_certificate_data(user_id, public_key)
+            'signature': self._sign_certificate_data(user_id, public_key, not_before, not_after)
         }
         
         self.users_certificates[user_id] = cert
         return cert
     
-    def _sign_certificate_data(self, user_id, public_key):
+    def _sign_certificate_data(self, user_id, public_key, not_before, not_after):
         """Sign certificate data with CA private key"""
-        data = f"{user_id}:{public_key[:100]}:{datetime.now().timestamp()}"
+        data = f"{user_id}:{public_key[:100]}:{not_before.isoformat()}:{not_after.isoformat()}"
         hash_obj = SHA256.new(data.encode())
         signer = pkcs1_15.new(self.ca_key)
         signature = signer.sign(hash_obj)
@@ -107,19 +110,29 @@ class CertificateAuthority:
             return False, "Certificate serial mismatch"
         
         # Check expiry
-        not_after = stored_cert['validity']['not_after']
+        not_after = certificate['validity']['not_after']
         if isinstance(not_after, str):
             not_after = datetime.fromisoformat(not_after)
         
         if datetime.now() > not_after:
             return False, "Certificate expired"
         
+        # Verify signature
+        try:
+            data = f"{user_id}:{certificate['public_key'][:100]}:{certificate['validity']['not_before']}:{certificate['validity']['not_after']}"
+            hash_obj = SHA256.new(data.encode())
+            verifier = pkcs1_15.new(self.ca_key)
+            verifier.verify(hash_obj, base64.b64decode(certificate['signature']))
+        except:
+            return False, "Certificate signature invalid"
+        
         return True, "Certificate valid"
     
     def revoke_certificate(self, user_id):
         """Revoke a certificate"""
         if user_id in self.users_certificates:
-            self.revoked_certificates.append(user_id)
+            if user_id not in self.revoked_certificates:
+                self.revoked_certificates.append(user_id)
             return True
         return False
 
@@ -444,7 +457,7 @@ class FileHandler:
         except:
             text_widget.insert('1.0', "Unable to display file as text. It may be a binary file.")
         
-        text_widget.config(state='normal')  # Allow editing/saving
+        text_widget.config(state='normal')
     
     @staticmethod
     def _open_image_viewer(image_path, parent_window):
@@ -509,7 +522,6 @@ class FileHandler:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load image: {str(e)}")
             viewer.destroy()
-    
     
     @staticmethod
     def _open_with_default_app(file_path):
@@ -691,11 +703,31 @@ class SecureSteganographySystem:
         self.current_message_attachment = None
         self.file_handler = FileHandler()
         
+        # Admin variables
+        self.user_tree = None
+        self.cert_tree = None
+        
         # Initialize system
         self.init_database()
         self.ca.initialize()
+        self.load_ca_state()
         
         self.show_auth_screen()
+    
+    def load_ca_state(self):
+        """Load CA state from database"""
+        if self.db_conn:
+            try:
+                cursor = self.db_conn.cursor(buffered=True)
+                cursor.execute('SELECT id, certificate_data, certificate_revoked FROM users WHERE certificate_data IS NOT NULL')
+                for user_id, cert_data, revoked in cursor.fetchall():
+                    if cert_data:
+                        self.ca.users_certificates[user_id] = json.loads(cert_data)
+                    if revoked:
+                        self.ca.revoke_certificate(user_id)
+                cursor.close()
+            except Exception as e:
+                print(f"Error loading CA state: {e}")
     
     def init_database(self):
         """Initialize database with comprehensive schema"""
@@ -842,13 +874,15 @@ class SecureSteganographySystem:
                 public_key = admin_key.publickey().export_key().decode('utf-8')
                 private_key = admin_key.export_key().decode('utf-8')
                 
-                kdf = hashlib.pbkdf2_hmac('sha256', "admin123".encode('utf-8'), b'salt', 100000, dklen=32)
+                salt = secrets.token_bytes(16)
+                kdf = hashlib.pbkdf2_hmac('sha256', "admin123".encode('utf-8'), salt, 100000, dklen=32)
                 cipher = AES.new(kdf, AES.MODE_GCM)
                 ciphertext, tag = cipher.encrypt_and_digest(private_key.encode('utf-8'))
                 private_key_encrypted = json.dumps({
                     'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
                     'tag': base64.b64encode(tag).decode('utf-8'),
-                    'nonce': base64.b64encode(cipher.nonce).decode('utf-8')
+                    'nonce': base64.b64encode(cipher.nonce).decode('utf-8'),
+                    'salt': base64.b64encode(salt).decode('utf-8')
                 })
                 
                 cursor.execute('''
@@ -856,6 +890,18 @@ class SecureSteganographySystem:
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ''', ('admin', 'admin@steganography.com', password_hash, 'System Administrator', 'admin', 
                      public_key, private_key_encrypted))
+                
+                # Issue certificate for admin
+                admin_id = cursor.lastrowid
+                user_info = {'username': 'admin', 'email': 'admin@steganography.com', 'organization': 'System'}
+                certificate = self.ca.issue_certificate(admin_id, public_key, user_info)
+                
+                cursor.execute('''
+                    UPDATE users 
+                    SET certificate_data = %s, certificate_issued = %s, certificate_expires = %s
+                    WHERE id = %s
+                ''', (json.dumps(certificate), datetime.now(), datetime.now() + timedelta(days=365), admin_id))
+                
                 self.db_conn.commit()
             
             # Create test users if they don't exist
@@ -877,19 +923,33 @@ class SecureSteganographySystem:
                     public_key = user_key.publickey().export_key().decode('utf-8')
                     private_key = user_key.export_key().decode('utf-8')
                     
-                    kdf = hashlib.pbkdf2_hmac('sha256', "password123".encode('utf-8'), b'salt', 100000, dklen=32)
+                    salt = secrets.token_bytes(16)
+                    kdf = hashlib.pbkdf2_hmac('sha256', "password123".encode('utf-8'), salt, 100000, dklen=32)
                     cipher = AES.new(kdf, AES.MODE_GCM)
                     ciphertext, tag = cipher.encrypt_and_digest(private_key.encode('utf-8'))
                     private_key_encrypted = json.dumps({
                         'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
                         'tag': base64.b64encode(tag).decode('utf-8'),
-                        'nonce': base64.b64encode(cipher.nonce).decode('utf-8')
+                        'nonce': base64.b64encode(cipher.nonce).decode('utf-8'),
+                        'salt': base64.b64encode(salt).decode('utf-8')
                     })
                     
                     cursor.execute('''
                         INSERT INTO users (username, email, password_hash, full_name, role, public_key, private_key_encrypted)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ''', (username, email, password_hash, full_name, role, public_key, private_key_encrypted))
+                    
+                    # Issue certificate for test user
+                    user_id = cursor.lastrowid
+                    user_info = {'username': username, 'email': email, 'organization': 'Test'}
+                    certificate = self.ca.issue_certificate(user_id, public_key, user_info)
+                    
+                    cursor.execute('''
+                        UPDATE users 
+                        SET certificate_data = %s, certificate_issued = %s, certificate_expires = %s
+                        WHERE id = %s
+                    ''', (json.dumps(certificate), datetime.now(), datetime.now() + timedelta(days=365), user_id))
+                    
                     self.db_conn.commit()
             
             cursor.close()
@@ -1220,9 +1280,9 @@ class SecureSteganographySystem:
             cursor = self.db_conn.cursor(buffered=True)
             cursor.execute('''
                 SELECT id, username, email, password_hash, full_name, role, 
-                       public_key, certificate_data, certificate_revoked
+                       public_key, certificate_data, certificate_revoked, is_active
                 FROM users 
-                WHERE (username = %s OR email = %s) AND is_active = 1
+                WHERE (username = %s OR email = %s)
             ''', (username, username))
             
             user = cursor.fetchone()
@@ -1230,22 +1290,34 @@ class SecureSteganographySystem:
             
             if user:
                 user_id, db_username, email, password_hash, full_name, role, \
-                public_key, cert_data, cert_revoked = user
+                public_key, cert_data, cert_revoked, is_active = user
+                
+                if not is_active:
+                    messagebox.showerror("Error", "Your account has been deactivated. Contact administrator.")
+                    cursor.close()
+                    return
                 
                 if bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8')):
-                    if self.use_pki_auth.get() and public_key:
+                    # Certificate validation
+                    if self.use_pki_auth.get():
+                        if not cert_data:
+                            messagebox.showerror("PKI Error", "No digital certificate found. Register with PKI first.")
+                            cursor.close()
+                            return
+                        
                         if cert_revoked:
                             messagebox.showerror("PKI Error", "Your certificate has been revoked")
                             cursor.close()
                             return
                         
-                        if cert_data:
-                            cert = json.loads(cert_data)
-                            valid, msg = self.ca.verify_certificate(user_id, cert)
-                            if not valid:
-                                messagebox.showerror("PKI Error", f"Certificate invalid: {msg}")
-                                cursor.close()
-                                return
+                        cert = json.loads(cert_data)
+                        valid, msg = self.ca.verify_certificate(user_id, cert)
+                        if not valid:
+                            messagebox.showerror("PKI Error", f"Certificate invalid: {msg}")
+                            cursor.close()
+                            return
+                        
+                        messagebox.showinfo("PKI Authentication", "✅ Digital certificate verified successfully!")
                     
                     cursor.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = %s', (user_id,))
                     self.db_conn.commit()
@@ -1260,11 +1332,12 @@ class SecureSteganographySystem:
                         'certificate': json.loads(cert_data) if cert_data else None
                     }
                     
-                    self.log_activity(user_id, "PKI_LOGIN", "User authenticated with PKI")
+                    self.log_activity(user_id, "LOGIN", f"User logged in (PKI: {self.use_pki_auth.get()})")
                     
-                    messagebox.showinfo("PKI Authentication", 
+                    messagebox.showinfo("Authentication Successful", 
                                       f"✅ Welcome {full_name}!\n"
-                                      f"PKI Certificate: {'Valid' if cert_data else 'Not issued'}")
+                                      f"Role: {role.upper()}\n"
+                                      f"Certificate: {'Valid' if cert_data and not cert_revoked else 'Not used'}")
                     
                     cursor.close()
                     self.show_main_application()
@@ -1351,14 +1424,18 @@ class SecureSteganographySystem:
             public_key = key_pair.publickey().export_key().decode('utf-8')
             
             private_key = key_pair.export_key().decode('utf-8')
+            
+            # Generate random salt
+            salt = secrets.token_bytes(16)
             kdf = hashlib.pbkdf2_hmac('sha256', user_data['password'].encode('utf-8'), 
-                                     b'salt', 100000, dklen=32)
+                                     salt, 100000, dklen=32)
             cipher = AES.new(kdf, AES.MODE_GCM)
             ciphertext, tag = cipher.encrypt_and_digest(private_key.encode('utf-8'))
             private_key_encrypted = json.dumps({
                 'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
                 'tag': base64.b64encode(tag).decode('utf-8'),
-                'nonce': base64.b64encode(cipher.nonce).decode('utf-8')
+                'nonce': base64.b64encode(cipher.nonce).decode('utf-8'),
+                'salt': base64.b64encode(salt).decode('utf-8')
             })
             
             password_hash = bcrypt.hashpw(user_data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -1392,14 +1469,14 @@ class SecureSteganographySystem:
             certificate_expiry = datetime.now() + timedelta(days=365)
             cursor.execute('''
                 UPDATE users 
-                SET certificate_data = %s, certificate_issued = %s, certificate_expires = %s
+                SET certificate_data = %s, certificate_issued = %s, certificate_expires = %s, certificate_revoked = FALSE
                 WHERE id = %s
-            ''', (json.dumps(certificate, default=str), datetime.now(), certificate_expiry, user_id))
+            ''', (json.dumps(certificate), datetime.now(), certificate_expiry, user_id))
             
             self.db_conn.commit()
             
-            self.log_activity(user_id, "PKI_REGISTRATION", 
-                            f"User registered with {key_bits}-bit RSA key and certificate")
+            self.log_activity(user_id, "REGISTRATION", 
+                            f"User registered with {key_bits}-bit RSA key and certificate issued")
             
             cursor.close()
             
@@ -1409,7 +1486,8 @@ class SecureSteganographySystem:
                               f"Username: {user_data['username']}\n"
                               f"Certificate: {certificate['serial']}\n"
                               f"Key Strength: {key_bits}-bit RSA\n"
-                              f"Certificate Valid Until: {certificate_expiry.strftime('%Y-%m-%d')}")
+                              f"Certificate Valid Until: {certificate_expiry.strftime('%Y-%m-%d')}\n\n"
+                              f"You can now login with PKI certificate by checking 'Use Digital Certificate'")
             
             self.register_name.delete(0, tk.END)
             self.register_email.delete(0, tk.END)
@@ -1420,8 +1498,6 @@ class SecureSteganographySystem:
             self.security_question.delete(0, tk.END)
             self.security_answer.delete(0, tk.END)
             self.security_question.insert(0, "What is your mother's maiden name?")
-            
-            self.show_auth_screen()
             
         except Exception as e:
             error_details = f"Registration failed:\n\nError: {str(e)}\n\n"
@@ -1457,6 +1533,7 @@ class SecureSteganographySystem:
         self.create_security_tab()
         self.create_usecase_tab()
         
+        # Admin tab - now with full functionality
         if self.current_user and self.current_user['role'] == 'admin':
             self.create_admin_tab()
         
@@ -1637,7 +1714,14 @@ class SecureSteganographySystem:
                 cursor.fetchall()
                 
                 if self.current_user.get('public_key'):
-                    stats['key_strength'] = len(self.current_user['public_key']) // 3
+                    # Rough estimate of key strength based on public key length
+                    key_len = len(self.current_user['public_key'])
+                    if key_len < 500:
+                        stats['key_strength'] = 1024
+                    elif key_len < 1000:
+                        stats['key_strength'] = 2048
+                    else:
+                        stats['key_strength'] = 3072
                 
                 cursor.close()
             except Exception as e:
@@ -1734,16 +1818,20 @@ class SecureSteganographySystem:
                 return
             
             encrypted_data = json.loads(result[0])
+            
+            # Decode components
+            salt = base64.b64decode(encrypted_data['salt'])
+            nonce = base64.b64decode(encrypted_data['nonce'])
+            tag = base64.b64decode(encrypted_data['tag'])
+            ciphertext = base64.b64decode(encrypted_data['ciphertext'])
+            
+            # Derive key using same parameters
             kdf = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), 
-                                     b'salt', 100000, dklen=32)
+                                     salt, 100000, dklen=32)
             
-            cipher = AES.new(kdf, AES.MODE_GCM, 
-                           nonce=base64.b64decode(encrypted_data['nonce']))
-            
-            private_key_bytes = cipher.decrypt_and_verify(
-                base64.b64decode(encrypted_data['ciphertext']),
-                base64.b64decode(encrypted_data['tag'])
-            )
+            # Decrypt private key
+            cipher = AES.new(kdf, AES.MODE_GCM, nonce=nonce)
+            private_key_bytes = cipher.decrypt_and_verify(ciphertext, tag)
             
             private_key = private_key_bytes.decode('utf-8')
             
@@ -1863,18 +1951,24 @@ class SecureSteganographySystem:
             
             cursor = self.db_conn.cursor(buffered=True)
             
-            cursor.execute('''SELECT id, public_key, certificate_data 
-                            FROM users WHERE username = %s''',
+            cursor.execute('''SELECT id, public_key, certificate_data, certificate_revoked 
+                            FROM users WHERE username = %s AND is_active = 1''',
                          (expected_signer,))
             signer = cursor.fetchone()
             cursor.fetchall()
             
             if not signer:
-                messagebox.showerror("Error", "Signer not found")
+                messagebox.showerror("Error", "Signer not found or account deactivated")
                 cursor.close()
                 return
             
-            signer_id, public_key, cert_data = signer
+            signer_id, public_key, cert_data, cert_revoked = signer
+            
+            if cert_revoked:
+                messagebox.showerror("Error", "Signer's certificate has been revoked")
+                cursor.close()
+                return
+            
             certificate = json.loads(cert_data) if cert_data else None
             
             result = self.document_signer.verify_signature(
@@ -2072,11 +2166,13 @@ class SecureSteganographySystem:
                 data = f.read()
         
         if password:
+            salt = secrets.token_bytes(16)
             kdf = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), 
-                                     b'salt', 100000, dklen=32)
+                                     salt, 100000, dklen=32)
             cipher = AES.new(kdf, AES.MODE_GCM)
             ciphertext, tag = cipher.encrypt_and_digest(data)
-            data = cipher.nonce + tag + ciphertext
+            # Package: salt + nonce + tag + ciphertext
+            data = salt + cipher.nonce + tag + ciphertext
         
         output_path = f"stego_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         success, message = self.stego.embed_data_lsb(image_path, data, output_path)
@@ -2157,22 +2253,23 @@ class SecureSteganographySystem:
                 messagebox.showerror("Error", "No hidden data found in image")
                 return
             
+            encrypted = False
             if password:
                 try:
-                    nonce = data[:16]
-                    tag = data[16:32]
-                    ciphertext = data[32:]
+                    # Extract components: salt(16) + nonce(16) + tag(16) + ciphertext
+                    salt = data[:16]
+                    nonce = data[16:32]
+                    tag = data[32:48]
+                    ciphertext = data[48:]
                     
                     kdf = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), 
-                                             b'salt', 100000, dklen=32)
+                                             salt, 100000, dklen=32)
                     cipher = AES.new(kdf, AES.MODE_GCM, nonce=nonce)
                     data = cipher.decrypt_and_verify(ciphertext, tag)
                     encrypted = True
-                except:
-                    messagebox.showerror("Error", "Decryption failed - wrong password or data not encrypted")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Decryption failed: {str(e)}")
                     return
-            else:
-                encrypted = False
             
             # Try to decode as text
             try:
@@ -2490,7 +2587,7 @@ Test Users Available in Demo Mode:
             
             cursor = self.db_conn.cursor(buffered=True)
             
-            cursor.execute('SELECT id, public_key FROM users WHERE username = %s', 
+            cursor.execute('SELECT id, public_key, is_active FROM users WHERE username = %s', 
                          (recipient,))
             recipient_data = cursor.fetchone()
             cursor.fetchall()
@@ -2500,7 +2597,12 @@ Test Users Available in Demo Mode:
                 cursor.close()
                 return
             
-            recipient_id, recipient_pubkey = recipient_data
+            recipient_id, recipient_pubkey, is_active = recipient_data
+            
+            if not is_active:
+                messagebox.showerror("Error", "Recipient account is deactivated")
+                cursor.close()
+                return
             
             message_package = {
                 'sender': self.current_user['id'],
@@ -2905,17 +3007,20 @@ Test Users Available in Demo Mode:
             
             encrypted_key_data = json.loads(key_result[0])
             
+            # Decode components
+            salt = base64.b64decode(encrypted_key_data['salt'])
+            nonce = base64.b64decode(encrypted_key_data['nonce'])
+            tag = base64.b64decode(encrypted_key_data['tag'])
+            ciphertext = base64.b64decode(encrypted_key_data['ciphertext'])
+            
+            # Derive key using same parameters
             kdf = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), 
-                                     b'salt', 100000, dklen=32)
+                                     salt, 100000, dklen=32)
             
             try:
-                cipher = AES.new(kdf, AES.MODE_GCM,
-                               nonce=base64.b64decode(encrypted_key_data['nonce']))
-                
-                private_key_bytes = cipher.decrypt_and_verify(
-                    base64.b64decode(encrypted_key_data['ciphertext']),
-                    base64.b64decode(encrypted_key_data['tag'])
-                )
+                # Decrypt private key
+                cipher = AES.new(kdf, AES.MODE_GCM, nonce=nonce)
+                private_key_bytes = cipher.decrypt_and_verify(ciphertext, tag)
                 
                 private_key = private_key_bytes.decode('utf-8')
                 
@@ -3172,133 +3277,1076 @@ Time: {timestamp}
                 self.create_receive_message_tab(receive_frame)
                 break
     
+    # ==================== FULL ADMIN FUNCTIONALITY ====================
+    
     def create_admin_tab(self):
         """Create admin tab with comprehensive user management"""
         admin_frame = tk.Frame(self.notebook, bg=self.colors['dark'])
+        self.notebook.add(admin_frame, text='⚙️ Admin')
         
-        if self.current_user and self.current_user['role'] == 'admin':
-            self.notebook.add(admin_frame, text='⚙️ Admin')
-            
-            admin_notebook = ttk.Notebook(admin_frame)
-            admin_notebook.pack(fill='both', expand=True, padx=10, pady=10)
-            
-            user_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
-            admin_notebook.add(user_mgmt_frame, text='👥 User Management')
-            self.create_user_management_tab(user_mgmt_frame)
-            
-            cert_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
-            admin_notebook.add(cert_mgmt_frame, text='🎫 Certificate Mgmt')
-            self.create_certificate_management_tab(cert_mgmt_frame)
-            
-            db_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
-            admin_notebook.add(db_mgmt_frame, text='🗄️ Database Mgmt')
-            self.create_database_management_tab(db_mgmt_frame)
-            
-            audit_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
-            admin_notebook.add(audit_frame, text='📜 Audit Logs')
-            self.create_audit_logs_tab(audit_frame)
+        # Create notebook for admin sub-tabs
+        admin_notebook = ttk.Notebook(admin_frame)
+        admin_notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # User Management Tab
+        user_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
+        admin_notebook.add(user_mgmt_frame, text='👥 User Management')
+        self.create_user_management_tab(user_mgmt_frame)
+        
+        # Certificate Management Tab
+        cert_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
+        admin_notebook.add(cert_mgmt_frame, text='🎫 Certificate Mgmt')
+        self.create_certificate_management_tab(cert_mgmt_frame)
+        
+        # Database Management Tab
+        db_mgmt_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
+        admin_notebook.add(db_mgmt_frame, text='🗄️ Database Mgmt')
+        self.create_database_management_tab(db_mgmt_frame)
+        
+        # Audit Logs Tab
+        audit_frame = tk.Frame(admin_notebook, bg=self.colors['dark'])
+        admin_notebook.add(audit_frame, text='📜 Audit Logs')
+        self.create_audit_logs_tab(audit_frame)
     
     def create_user_management_tab(self, parent):
-        """Create user management interface"""
-        tk.Label(parent, text="User Management System",
-                font=('Arial', 16, 'bold'),
-                bg=self.colors['dark'], fg=self.colors['light']).pack(pady=20)
+        """Create user management interface with full functionality"""
+        # Clear any existing widgets
+        for widget in parent.winfo_children():
+            widget.destroy()
         
-        info_frame = tk.Frame(parent, bg='#2c3e50', relief='raised', bd=2)
-        info_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        # Control Panel
+        control_frame = tk.Frame(parent, bg=self.colors['dark'])
+        control_frame.pack(fill='x', padx=10, pady=10)
         
-        info_text = """👥 USER MANAGEMENT FUNCTIONS
+        tk.Button(control_frame, text="🔄 Refresh User List",
+                 command=self.refresh_user_list,
+                 bg=self.colors['primary'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(control_frame, text="➕ Add New User",
+                 command=self.admin_add_user,
+                 bg=self.colors['success'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(control_frame, text="📊 View Statistics",
+                 command=self.view_user_statistics,
+                 bg=self.colors['info'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Create Treeview for users
+        tree_frame = tk.Frame(parent, bg=self.colors['dark'])
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Scrollbars
+        v_scrollbar = tk.Scrollbar(tree_frame)
+        v_scrollbar.pack(side='right', fill='y')
+        
+        h_scrollbar = tk.Scrollbar(tree_frame, orient='horizontal')
+        h_scrollbar.pack(side='bottom', fill='x')
+        
+        # Treeview
+        columns = ('ID', 'Username', 'Email', 'Full Name', 'Role', 'Active', 'Created', 'Last Login', 'Cert Status')
+        self.user_tree = ttk.Treeview(tree_frame, columns=columns, show='headings',
+                                      yscrollcommand=v_scrollbar.set,
+                                      xscrollcommand=h_scrollbar.set,
+                                      height=15)
+        
+        # Define headings
+        column_widths = [50, 100, 150, 120, 80, 60, 120, 120, 100]
+        for col, width in zip(columns, column_widths):
+            self.user_tree.heading(col, text=col)
+            self.user_tree.column(col, width=width, minwidth=width)
+        
+        self.user_tree.pack(fill='both', expand=True)
+        
+        v_scrollbar.config(command=self.user_tree.yview)
+        h_scrollbar.config(command=self.user_tree.xview)
+        
+        # Action buttons frame
+        action_frame = tk.Frame(parent, bg=self.colors['dark'])
+        action_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Left side actions
+        left_actions = tk.Frame(action_frame, bg=self.colors['dark'])
+        left_actions.pack(side='left')
+        
+        tk.Button(left_actions, text="✏️ Edit Selected",
+                 command=self.admin_edit_user,
+                 bg=self.colors['primary'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(left_actions, text="🔑 Reset Password",
+                 command=self.admin_reset_password,
+                 bg=self.colors['warning'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(left_actions, text="🎫 Manage Certificate",
+                 command=self.admin_manage_certificate,
+                 bg=self.colors['info'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Right side actions
+        right_actions = tk.Frame(action_frame, bg=self.colors['dark'])
+        right_actions.pack(side='right')
+        
+        tk.Button(right_actions, text="❌ Delete User",
+                 command=self.admin_delete_user,
+                 bg=self.colors['danger'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Load user data
+        self.refresh_user_list()
+    
+    def refresh_user_list(self):
+        """Refresh the user list in treeview"""
+        if not self.db_conn:
+            messagebox.showerror("Error", "Database not connected")
+            return
+        
+        # Clear existing items
+        for item in self.user_tree.get_children():
+            self.user_tree.delete(item)
+        
+        try:
+            cursor = self.db_conn.cursor(buffered=True)
+            cursor.execute('''
+                SELECT id, username, email, full_name, role, is_active, 
+                       created_at, last_login, certificate_revoked,
+                       certificate_expires
+                FROM users
+                ORDER BY id
+            ''')
+            
+            for row in cursor.fetchall():
+                user_id, username, email, full_name, role, is_active, created, last_login, cert_revoked, cert_expires = row
+                
+                # Format dates
+                created_str = str(created)[:10] if created else 'N/A'
+                last_login_str = str(last_login)[:10] if last_login else 'Never'
+                
+                # Determine certificate status
+                if cert_revoked:
+                    cert_status = "❌ Revoked"
+                elif cert_expires and cert_expires > datetime.now():
+                    cert_status = "✅ Valid"
+                elif cert_expires:
+                    cert_status = "⚠️ Expired"
+                else:
+                    cert_status = "No Cert"
+                
+                active_status = "✅" if is_active else "❌"
+                
+                self.user_tree.insert('', 'end', values=(
+                    user_id, username, email, full_name or 'N/A', 
+                    role, active_status, created_str, last_login_str, cert_status
+                ))
+            
+            cursor.close()
+            self.log_activity(self.current_user['id'], "ADMIN_ACTION", "Viewed user list")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load users: {str(e)}")
+    
+    def get_selected_user(self):
+        """Get the currently selected user from treeview"""
+        selection = self.user_tree.selection()
+        if not selection:
+            messagebox.showerror("Error", "Please select a user")
+            return None
+        
+        item = self.user_tree.item(selection[0])
+        return {
+            'id': item['values'][0],
+            'username': item['values'][1],
+            'email': item['values'][2],
+            'full_name': item['values'][3],
+            'role': item['values'][4],
+            'active': item['values'][5] == "✅"
+        }
+    
+    def admin_edit_user(self):
+        """Edit selected user"""
+        user = self.get_selected_user()
+        if not user:
+            return
+        
+        # Create edit dialog
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title(f"Edit User: {user['username']}")
+        edit_window.geometry("450x350")
+        edit_window.configure(bg=self.colors['dark'])
+        edit_window.transient(self.root)
+        edit_window.grab_set()
+        
+        # Form fields
+        tk.Label(edit_window, text="Full Name:", bg=self.colors['dark'], 
+                fg=self.colors['light']).pack(pady=(10, 5))
+        name_var = tk.StringVar(value=user['full_name'])
+        tk.Entry(edit_window, textvariable=name_var, width=40,
+                bg='#2c3e50', fg='white').pack(pady=5)
+        
+        tk.Label(edit_window, text="Email:", bg=self.colors['dark'],
+                fg=self.colors['light']).pack(pady=(10, 5))
+        email_var = tk.StringVar(value=user['email'])
+        tk.Entry(edit_window, textvariable=email_var, width=40,
+                bg='#2c3e50', fg='white').pack(pady=5)
+        
+        tk.Label(edit_window, text="Role:", bg=self.colors['dark'],
+                fg=self.colors['light']).pack(pady=(10, 5))
+        role_var = tk.StringVar(value=user['role'])
+        role_combo = ttk.Combobox(edit_window, textvariable=role_var,
+                                  values=['user', 'admin'], width=37)
+        role_combo.pack(pady=5)
+        
+        tk.Label(edit_window, text="Account Status:", bg=self.colors['dark'],
+                fg=self.colors['light']).pack(pady=(10, 5))
+        active_var = tk.BooleanVar(value=user['active'])
+        tk.Checkbutton(edit_window, text="Active Account",
+                      variable=active_var,
+                      bg=self.colors['dark'],
+                      fg=self.colors['light'],
+                      selectcolor=self.colors['dark']).pack(pady=5)
+        
+        def save_changes():
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute('''
+                    UPDATE users 
+                    SET full_name = %s, email = %s, role = %s, is_active = %s
+                    WHERE id = %s
+                ''', (name_var.get(), email_var.get(), role_var.get(), 
+                     active_var.get(), user['id']))
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Edited user {user['username']}")
+                
+                messagebox.showinfo("Success", "User updated successfully")
+                edit_window.destroy()
+                self.refresh_user_list()
+                
+            except mysql.connector.IntegrityError:
+                messagebox.showerror("Error", "Email already exists")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update user: {str(e)}")
+        
+        # Buttons
+        btn_frame = tk.Frame(edit_window, bg=self.colors['dark'])
+        btn_frame.pack(pady=20)
+        
+        tk.Button(btn_frame, text="💾 Save Changes",
+                 command=save_changes,
+                 bg=self.colors['success'], fg='white',
+                 padx=20, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="❌ Cancel",
+                 command=edit_window.destroy,
+                 bg=self.colors['danger'], fg='white',
+                 padx=20, pady=5).pack(side='left', padx=5)
+    
+    def admin_reset_password(self):
+        """Reset password for selected user"""
+        user = self.get_selected_user()
+        if not user:
+            return
+        
+        if user['id'] == self.current_user['id']:
+            messagebox.showerror("Error", "Cannot reset your own password. Use profile settings.")
+            return
+        
+        result = messagebox.askyesno("Confirm Password Reset",
+                                    f"Reset password for {user['username']}?\n\n"
+                                    "New password will be: 'Temp123!'")
+        
+        if result:
+            try:
+                new_password = "Temp123!"
+                password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                
+                cursor = self.db_conn.cursor()
+                cursor.execute('UPDATE users SET password_hash = %s WHERE id = %s',
+                             (password_hash, user['id']))
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Reset password for user {user['username']}")
+                
+                messagebox.showinfo("Success", 
+                                  f"Password reset for {user['username']}\n\n"
+                                  f"New password: {new_password}\n\n"
+                                  "User must change password on next login.")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to reset password: {str(e)}")
+    
+    def admin_manage_certificate(self):
+        """Manage certificate for selected user"""
+        user = self.get_selected_user()
+        if not user:
+            return
+        
+        # Create certificate management dialog
+        cert_window = tk.Toplevel(self.root)
+        cert_window.title(f"Certificate Management - {user['username']}")
+        cert_window.geometry("500x400")
+        cert_window.configure(bg=self.colors['dark'])
+        cert_window.transient(self.root)
+        cert_window.grab_set()
+        
+        try:
+            cursor = self.db_conn.cursor(buffered=True)
+            cursor.execute('''
+                SELECT public_key, certificate_data, certificate_issued, 
+                       certificate_expires, certificate_revoked
+                FROM users WHERE id = %s
+            ''', (user['id'],))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result:
+                public_key, cert_data, issued, expires, revoked = result
+                
+                info_text = f"""📜 CERTIFICATE INFORMATION
 
-1. View all users
-2. Edit user details
-3. Delete users
-4. Reset passwords
-5. Manage user roles
-6. View user activity
+User: {user['username']}
+Has Public Key: {'✅ Yes' if public_key else '❌ No'}
+Has Certificate: {'✅ Yes' if cert_data else '❌ No'}
+Certificate Revoked: {'✅ Yes' if revoked else '❌ No'}
 
-To implement:
-• User list with search
-• Edit user dialog
-• Delete confirmation
-• Password reset functionality
+Issued: {issued if issued else 'N/A'}
+Expires: {expires if expires else 'N/A'}
+
 """
+                # Status info
+                status_frame = tk.Frame(cert_window, bg='#2c3e50', relief='raised', bd=2)
+                status_frame.pack(fill='x', padx=20, pady=10)
+                
+                tk.Label(status_frame, text=info_text, font=('Courier', 10),
+                        bg='#2c3e50', fg='white', justify='left').pack(padx=10, pady=10)
+                
+                # Action buttons
+                btn_frame = tk.Frame(cert_window, bg=self.colors['dark'])
+                btn_frame.pack(pady=20)
+                
+                if not revoked and cert_data:
+                    tk.Button(btn_frame, text="❌ Revoke Certificate",
+                             command=lambda: self.admin_revoke_certificate(user['id'], user['username'], cert_window),
+                             bg=self.colors['danger'], fg='white',
+                             padx=20, pady=5).pack(pady=5)
+                
+                if not cert_data or revoked:
+                    tk.Button(btn_frame, text="🎫 Issue New Certificate",
+                             command=lambda: self.admin_issue_certificate(user['id'], user['username'], cert_window),
+                             bg=self.colors['success'], fg='white',
+                             padx=20, pady=5).pack(pady=5)
+                
+                if cert_data:
+                    tk.Button(btn_frame, text="📋 View Certificate Details",
+                             command=lambda: self.admin_view_certificate(cert_data),
+                             bg=self.colors['info'], fg='white',
+                             padx=20, pady=5).pack(pady=5)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load certificate info: {str(e)}")
+            cert_window.destroy()
+    
+    def admin_revoke_certificate(self, user_id, username, window):
+        """Revoke user's certificate"""
+        result = messagebox.askyesno("Confirm Revocation",
+                                    f"Revoke certificate for {username}?\n\n"
+                                    "This will invalidate their digital certificate.")
         
-        text_widget = scrolledtext.ScrolledText(info_frame, width=80, height=15,
-                                              font=('Courier', 10),
-                                              bg='#2c3e50', fg='white')
-        text_widget.pack(padx=10, pady=10)
-        text_widget.insert('1.0', info_text)
-        text_widget.config(state='disabled')
+        if result:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute('UPDATE users SET certificate_revoked = TRUE WHERE id = %s',
+                             (user_id,))
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.ca.revoke_certificate(user_id)
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Revoked certificate for user {username}")
+                
+                messagebox.showinfo("Success", f"Certificate revoked for {username}")
+                window.destroy()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to revoke certificate: {str(e)}")
+    
+    def admin_issue_certificate(self, user_id, username, window):
+        """Issue new certificate for user"""
+        try:
+            cursor = self.db_conn.cursor(buffered=True)
+            cursor.execute('''
+                SELECT username, email, organization, public_key 
+                FROM users WHERE id = %s
+            ''', (user_id,))
+            result = cursor.fetchone()
+            
+            if result and result[3]:  # Has public key
+                db_username, email, org, public_key = result
+                
+                user_info = {
+                    'username': db_username,
+                    'email': email,
+                    'organization': org or 'Individual'
+                }
+                
+                certificate = self.ca.issue_certificate(user_id, public_key, user_info)
+                expiry = datetime.now() + timedelta(days=365)
+                
+                cursor.execute('''
+                    UPDATE users 
+                    SET certificate_data = %s, certificate_issued = %s, 
+                        certificate_expires = %s, certificate_revoked = FALSE
+                    WHERE id = %s
+                ''', (json.dumps(certificate), datetime.now(), expiry, user_id))
+                
+                self.db_conn.commit()
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Issued certificate for user {username}")
+                
+                messagebox.showinfo("Success", 
+                                  f"Certificate issued for {username}\n"
+                                  f"Serial: {certificate['serial']}\n"
+                                  f"Valid until: {expiry.strftime('%Y-%m-%d')}")
+                window.destroy()
+                
+            else:
+                messagebox.showerror("Error", "User has no public key. Cannot issue certificate.")
+            
+            cursor.close()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to issue certificate: {str(e)}")
+    
+    def admin_view_certificate(self, cert_data):
+        """Display certificate details"""
+        try:
+            cert = json.loads(cert_data)
+            
+            # Format certificate info
+            info = f"""🔐 CERTIFICATE DETAILS
+========================================
+Version: {cert.get('version', 'N/A')}
+Serial Number: {cert.get('serial', 'N/A')}
+
+ISSUED TO:
+  Common Name: {cert['subject'].get('CN', 'N/A')}
+  Email: {cert['subject'].get('email', 'N/A')}
+  Organization: {cert['subject'].get('O', 'N/A')}
+  UID: {cert['subject'].get('UID', 'N/A')}
+
+ISSUED BY:
+  Common Name: {cert['issuer'].get('CN', 'N/A')}
+  Organization: {cert['issuer'].get('O', 'N/A')}
+  Country: {cert['issuer'].get('C', 'N/A')}
+
+VALIDITY:
+  Not Before: {cert['validity'].get('not_before', 'N/A')}
+  Not After: {cert['validity'].get('not_after', 'N/A')}
+
+Key Usage: {', '.join(cert.get('key_usage', []))}
+
+Public Key:
+{cert.get('public_key', 'N/A')[:200]}...
+"""
+            
+            # Create viewer window
+            viewer = tk.Toplevel(self.root)
+            viewer.title("Certificate Details")
+            viewer.geometry("700x600")
+            viewer.configure(bg=self.colors['dark'])
+            
+            text_widget = scrolledtext.ScrolledText(viewer, font=('Courier', 10),
+                                                   bg='#2c3e50', fg='white')
+            text_widget.pack(fill='both', expand=True, padx=10, pady=10)
+            text_widget.insert('1.0', info)
+            text_widget.config(state='disabled')
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to display certificate: {str(e)}")
+    
+    def admin_delete_user(self):
+        """Delete selected user"""
+        user = self.get_selected_user()
+        if not user:
+            return
+        
+        if user['id'] == self.current_user['id']:
+            messagebox.showerror("Error", "Cannot delete your own account")
+            return
+        
+        result = messagebox.askyesno("Confirm Delete",
+                                    f"⚠️ PERMANENTLY DELETE user '{user['username']}'?\n\n"
+                                    "This will remove:\n"
+                                    "• User account\n"
+                                    "• Digital certificate\n"
+                                    "• Signed documents\n"
+                                    "• All messages\n"
+                                    "• Audit logs\n\n"
+                                    "This action CANNOT be undone!")
+        
+        if result:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute('DELETE FROM users WHERE id = %s', (user['id'],))
+                self.db_conn.commit()
+                cursor.close()
+                
+                # Remove from CA
+                if user['id'] in self.ca.users_certificates:
+                    del self.ca.users_certificates[user['id']]
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Deleted user {user['username']}")
+                
+                messagebox.showinfo("Success", f"User '{user['username']}' deleted")
+                self.refresh_user_list()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete user: {str(e)}")
+    
+    def admin_add_user(self):
+        """Add new user as admin"""
+        # Create registration dialog (similar to registration but with admin privileges)
+        add_window = tk.Toplevel(self.root)
+        add_window.title("Add New User")
+        add_window.geometry("400x500")
+        add_window.configure(bg=self.colors['dark'])
+        add_window.transient(self.root)
+        add_window.grab_set()
+        
+        # Form fields
+        fields = {}
+        labels = ['Username', 'Email', 'Full Name', 'Organization', 'Password', 'Confirm Password']
+        
+        for label in labels:
+            tk.Label(add_window, text=label, bg=self.colors['dark'],
+                    fg=self.colors['light']).pack(pady=(10, 2))
+            entry = tk.Entry(add_window, width=40, bg='#2c3e50', fg='white')
+            if 'Password' in label:
+                entry.config(show='•')
+            entry.pack(pady=2)
+            fields[label.lower().replace(' ', '_')] = entry
+        
+        # Role selection
+        tk.Label(add_window, text="Role", bg=self.colors['dark'],
+                fg=self.colors['light']).pack(pady=(10, 2))
+        role_var = tk.StringVar(value='user')
+        role_frame = tk.Frame(add_window, bg=self.colors['dark'])
+        role_frame.pack()
+        tk.Radiobutton(role_frame, text="User", variable=role_var, value='user',
+                      bg=self.colors['dark'], fg=self.colors['light'],
+                      selectcolor=self.colors['dark']).pack(side='left', padx=10)
+        tk.Radiobutton(role_frame, text="Admin", variable=role_var, value='admin',
+                      bg=self.colors['dark'], fg=self.colors['light'],
+                      selectcolor=self.colors['dark']).pack(side='left', padx=10)
+        
+        # Active status
+        active_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(add_window, text="Account Active", variable=active_var,
+                      bg=self.colors['dark'], fg=self.colors['light'],
+                      selectcolor=self.colors['dark']).pack(pady=10)
+        
+        def create_user():
+            # Validate
+            if fields['password'].get() != fields['confirm_password'].get():
+                messagebox.showerror("Error", "Passwords do not match")
+                return
+            
+            if len(fields['password'].get()) < 8:
+                messagebox.showerror("Error", "Password must be at least 8 characters")
+                return
+            
+            try:
+                cursor = self.db_conn.cursor(buffered=True)
+                
+                # Check existing
+                cursor.execute('SELECT id FROM users WHERE username = %s OR email = %s',
+                             (fields['username'].get(), fields['email'].get()))
+                if cursor.fetchone():
+                    messagebox.showerror("Error", "Username or email already exists")
+                    cursor.close()
+                    return
+                
+                # Generate keys
+                key_pair = RSA.generate(2048)
+                public_key = key_pair.publickey().export_key().decode('utf-8')
+                private_key = key_pair.export_key().decode('utf-8')
+                
+                # Encrypt private key
+                salt = secrets.token_bytes(16)
+                kdf = hashlib.pbkdf2_hmac('sha256', fields['password'].get().encode('utf-8'),
+                                         salt, 100000, dklen=32)
+                cipher = AES.new(kdf, AES.MODE_GCM)
+                ciphertext, tag = cipher.encrypt_and_digest(private_key.encode('utf-8'))
+                private_key_encrypted = json.dumps({
+                    'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+                    'tag': base64.b64encode(tag).decode('utf-8'),
+                    'nonce': base64.b64encode(cipher.nonce).decode('utf-8'),
+                    'salt': base64.b64encode(salt).decode('utf-8')
+                })
+                
+                # Hash password
+                password_hash = bcrypt.hashpw(fields['password'].get().encode('utf-8'), 
+                                             bcrypt.gensalt()).decode('utf-8')
+                
+                # Insert user
+                cursor.execute('''
+                    INSERT INTO users (username, email, password_hash, full_name, 
+                                      organization, role, is_active, public_key, 
+                                      private_key_encrypted)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (fields['username'].get(), fields['email'].get(), password_hash,
+                     fields['full_name'].get(), fields['organization'].get(),
+                     role_var.get(), active_var.get(), public_key, private_key_encrypted))
+                
+                user_id = cursor.lastrowid
+                
+                # Issue certificate
+                user_info = {
+                    'username': fields['username'].get(),
+                    'email': fields['email'].get(),
+                    'organization': fields['organization'].get()
+                }
+                certificate = self.ca.issue_certificate(user_id, public_key, user_info)
+                
+                cursor.execute('''
+                    UPDATE users 
+                    SET certificate_data = %s, certificate_issued = %s, 
+                        certificate_expires = %s, certificate_revoked = FALSE
+                    WHERE id = %s
+                ''', (json.dumps(certificate), datetime.now(), 
+                     datetime.now() + timedelta(days=365), user_id))
+                
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Created user {fields['username'].get()}")
+                
+                messagebox.showinfo("Success", f"User {fields['username'].get()} created successfully!")
+                add_window.destroy()
+                self.refresh_user_list()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create user: {str(e)}")
+        
+        # Buttons
+        btn_frame = tk.Frame(add_window, bg=self.colors['dark'])
+        btn_frame.pack(pady=20)
+        
+        tk.Button(btn_frame, text="✅ Create User", command=create_user,
+                 bg=self.colors['success'], fg='white',
+                 padx=20, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(btn_frame, text="❌ Cancel", command=add_window.destroy,
+                 bg=self.colors['danger'], fg='white',
+                 padx=20, pady=5).pack(side='left', padx=5)
+    
+    def view_user_statistics(self):
+        """View user statistics"""
+        if not self.db_conn:
+            messagebox.showerror("Error", "Database not connected")
+            return
+        
+        try:
+            cursor = self.db_conn.cursor(buffered=True)
+            
+            # Get statistics
+            cursor.execute('SELECT COUNT(*) FROM users')
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE is_active = 1')
+            active_users = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE role = "admin"')
+            admin_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE certificate_data IS NOT NULL AND certificate_revoked = 0')
+            valid_certs = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE certificate_revoked = 1')
+            revoked_certs = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM signed_documents')
+            total_docs = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM secure_messages')
+            total_msgs = cursor.fetchone()[0]
+            
+            cursor.close()
+            
+            stats_text = f"""📊 SYSTEM STATISTICS
+========================================
+
+USER STATISTICS:
+• Total Users: {total_users}
+• Active Users: {active_users}
+• Admin Users: {admin_count}
+• Regular Users: {total_users - admin_count}
+
+CERTIFICATE STATISTICS:
+• Valid Certificates: {valid_certs}
+• Revoked Certificates: {revoked_certs}
+• Users without Certificate: {total_users - valid_certs - revoked_certs}
+
+ACTIVITY STATISTICS:
+• Total Signed Documents: {total_docs}
+• Total Secure Messages: {total_msgs}
+"""
+            
+            messagebox.showinfo("User Statistics", stats_text)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get statistics: {str(e)}")
     
     def create_certificate_management_tab(self, parent):
         """Create certificate management interface"""
-        tk.Label(parent, text="Certificate Management",
-                font=('Arial', 16, 'bold'),
-                bg=self.colors['dark'], fg=self.colors['light']).pack(pady=20)
+        # Clear existing widgets
+        for widget in parent.winfo_children():
+            widget.destroy()
         
-        info_frame = tk.Frame(parent, bg='#2c3e50', relief='raised', bd=2)
-        info_frame.pack(fill='both', expand=True, padx=20, pady=20)
+        # Control Panel
+        control_frame = tk.Frame(parent, bg=self.colors['dark'])
+        control_frame.pack(fill='x', padx=10, pady=10)
         
-        info_text = """🎫 CERTIFICATE MANAGEMENT FUNCTIONS
+        tk.Button(control_frame, text="🔄 Refresh Certificate List",
+                 command=self.refresh_certificate_list,
+                 bg=self.colors['primary'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(control_frame, text="📊 CA Status",
+                 command=self.view_ca_status,
+                 bg=self.colors['info'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Create Treeview for certificates
+        tree_frame = tk.Frame(parent, bg=self.colors['dark'])
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Scrollbars
+        v_scrollbar = tk.Scrollbar(tree_frame)
+        v_scrollbar.pack(side='right', fill='y')
+        h_scrollbar = tk.Scrollbar(tree_frame, orient='horizontal')
+        h_scrollbar.pack(side='bottom', fill='x')
+        
+        # Treeview
+        columns = ('ID', 'Username', 'Serial', 'Issued', 'Expires', 'Status', 'Revoked')
+        self.cert_tree = ttk.Treeview(tree_frame, columns=columns, show='headings',
+                                      yscrollcommand=v_scrollbar.set,
+                                      xscrollcommand=h_scrollbar.set,
+                                      height=15)
+        
+        column_widths = [50, 120, 100, 120, 120, 100, 80]
+        for col, width in zip(columns, column_widths):
+            self.cert_tree.heading(col, text=col)
+            self.cert_tree.column(col, width=width, minwidth=width)
+        
+        self.cert_tree.pack(fill='both', expand=True)
+        
+        v_scrollbar.config(command=self.cert_tree.yview)
+        h_scrollbar.config(command=self.cert_tree.xview)
+        
+        # Action buttons
+        action_frame = tk.Frame(parent, bg=self.colors['dark'])
+        action_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Button(action_frame, text="❌ Revoke Selected",
+                 command=self.admin_revoke_selected_certificate,
+                 bg=self.colors['danger'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(action_frame, text="📋 View Details",
+                 command=self.admin_view_selected_certificate,
+                 bg=self.colors['info'], fg='white',
+                 font=('Arial', 10, 'bold'),
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Load certificate data
+        self.refresh_certificate_list()
+    
+    def refresh_certificate_list(self):
+        """Refresh certificate list"""
+        if not self.db_conn:
+            return
+        
+        # Clear existing items
+        for item in self.cert_tree.get_children():
+            self.cert_tree.delete(item)
+        
+        try:
+            cursor = self.db_conn.cursor(buffered=True)
+            cursor.execute('''
+                SELECT u.id, u.username, u.certificate_data, 
+                       u.certificate_issued, u.certificate_expires, 
+                       u.certificate_revoked
+                FROM users u
+                WHERE u.certificate_data IS NOT NULL
+                ORDER BY u.id
+            ''')
+            
+            for row in cursor.fetchall():
+                user_id, username, cert_data, issued, expires, revoked = row
+                
+                if cert_data:
+                    cert = json.loads(cert_data)
+                    serial = cert.get('serial', 'N/A')
+                    
+                    issued_str = str(issued)[:10] if issued else 'N/A'
+                    expires_str = str(expires)[:10] if expires else 'N/A'
+                    
+                    # Determine status
+                    if revoked:
+                        status = "❌ Revoked"
+                    elif expires and expires > datetime.now():
+                        status = "✅ Valid"
+                    elif expires:
+                        status = "⚠️ Expired"
+                    else:
+                        status = "Unknown"
+                    
+                    revoked_str = "✅" if revoked else "❌"
+                    
+                    self.cert_tree.insert('', 'end', values=(
+                        user_id, username, serial, issued_str, 
+                        expires_str, status, revoked_str
+                    ))
+            
+            cursor.close()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load certificates: {str(e)}")
+    
+    def admin_revoke_selected_certificate(self):
+        """Revoke selected certificate"""
+        selection = self.cert_tree.selection()
+        if not selection:
+            messagebox.showerror("Error", "Please select a certificate")
+            return
+        
+        item = self.cert_tree.item(selection[0])
+        user_id = item['values'][0]
+        username = item['values'][1]
+        status = item['values'][5]
+        
+        if "Revoked" in status:
+            messagebox.showerror("Error", "Certificate already revoked")
+            return
+        
+        result = messagebox.askyesno("Confirm Revocation",
+                                    f"Revoke certificate for {username}?")
+        
+        if result:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute('UPDATE users SET certificate_revoked = TRUE WHERE id = %s',
+                             (user_id,))
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.ca.revoke_certificate(user_id)
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Revoked certificate for {username}")
+                
+                messagebox.showinfo("Success", f"Certificate revoked for {username}")
+                self.refresh_certificate_list()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to revoke certificate: {str(e)}")
+    
+    def admin_view_selected_certificate(self):
+        """View selected certificate details"""
+        selection = self.cert_tree.selection()
+        if not selection:
+            messagebox.showerror("Error", "Please select a certificate")
+            return
+        
+        item = self.cert_tree.item(selection[0])
+        user_id = item['values'][0]
+        
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute('SELECT certificate_data FROM users WHERE id = %s', (user_id,))
+            result = cursor.fetchone()
+            cursor.close()
+            
+            if result and result[0]:
+                self.admin_view_certificate(result[0])
+            else:
+                messagebox.showerror("Error", "Certificate data not found")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load certificate: {str(e)}")
+    
+    def view_ca_status(self):
+        """View Certificate Authority status"""
+        status_text = f"""🔐 CERTIFICATE AUTHORITY STATUS
+========================================
 
-1. View all certificates
-2. Revoke certificates
-3. Renew certificates
-4. Issue new certificates
-5. View certificate details
-6. Export certificates
+CA Certificate:
+• Subject: {self.ca.ca_cert['subject']['CN']}
+• Issuer: {self.ca.ca_cert['issuer']['CN']}
+• Serial: {self.ca.ca_cert['serial']}
+• Valid From: {self.ca.ca_cert['validity']['not_before']}
+• Valid Until: {self.ca.ca_cert['validity']['not_after']}
+• Key Usage: {', '.join(self.ca.ca_cert['key_usage'])}
 
-Certificate Authority Status:
-• CA Name: Secure Steganography CA
-• Status: Active
-• Root Key: 2048-bit RSA
-• Validity: 10 years
+Statistics:
+• Total Certificates Issued: {len(self.ca.users_certificates)}
+• Certificates Revoked: {len(self.ca.revoked_certificates)}
+• Active Certificates: {len(self.ca.users_certificates) - len(self.ca.revoked_certificates)}
 """
         
-        text_widget = scrolledtext.ScrolledText(info_frame, width=80, height=15,
-                                              font=('Courier', 10),
-                                              bg='#2c3e50', fg='white')
-        text_widget.pack(padx=10, pady=10)
-        text_widget.insert('1.0', info_text)
-        text_widget.config(state='disabled')
+        messagebox.showinfo("CA Status", status_text)
     
     def create_database_management_tab(self, parent):
         """Create database management interface"""
-        tk.Label(parent, text="Database Management",
-                font=('Arial', 16, 'bold'),
-                bg=self.colors['dark'], fg=self.colors['light']).pack(pady=20)
+        for widget in parent.winfo_children():
+            widget.destroy()
         
         if not self.db_conn:
             tk.Label(parent, text="❌ Database not connected",
                     font=('Arial', 14),
-                    bg=self.colors['dark'], fg=self.colors['danger']).pack(pady=10)
+                    bg=self.colors['dark'], fg=self.colors['danger']).pack(pady=50)
             return
         
-        info_frame = tk.Frame(parent, bg='#2c3e50', relief='raised', bd=2)
+        # Connection info
+        info_frame = tk.LabelFrame(parent, text="📊 Database Connection",
+                                  font=('Arial', 12, 'bold'),
+                                  bg=self.colors['dark'],
+                                  fg=self.colors['light'])
         info_frame.pack(fill='x', padx=20, pady=10)
         
-        info_text = f"""🗄️ DATABASE CONNECTION INFO
-
+        info_text = f"""
 Host: {self.db_config['host']}
 Port: {self.db_config['port']}
 Database: {self.db_config['database']}
 User: {self.db_config['user']}
 Status: ✅ Connected
+Tables: users, signed_documents, secure_messages, audit_log
 """
         
-        tk.Label(info_frame, text=info_text,
-                font=('Courier', 10),
-                bg='#2c3e50', fg='white',
-                justify='left').pack(padx=10, pady=10)
+        tk.Label(info_frame, text=info_text, font=('Courier', 10),
+                bg='#2c3e50', fg='white', justify='left').pack(padx=10, pady=10)
+        
+        # Table statistics
+        stats_frame = tk.LabelFrame(parent, text="📈 Table Statistics",
+                                   font=('Arial', 12, 'bold'),
+                                   bg=self.colors['dark'],
+                                   fg=self.colors['light'])
+        stats_frame.pack(fill='x', padx=20, pady=10)
+        
+        try:
+            cursor = self.db_conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM users')
+            user_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM signed_documents')
+            doc_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM secure_messages')
+            msg_count = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM audit_log')
+            log_count = cursor.fetchone()[0]
+            
+            cursor.close()
+            
+            stats_text = f"""
+Users: {user_count}
+Signed Documents: {doc_count}
+Secure Messages: {msg_count}
+Audit Log Entries: {log_count}
+"""
+            
+            tk.Label(stats_frame, text=stats_text, font=('Courier', 10),
+                    bg='#2c3e50', fg='white', justify='left').pack(padx=10, pady=10)
+            
+        except Exception as e:
+            tk.Label(stats_frame, text=f"Error loading stats: {str(e)}",
+                    bg='#2c3e50', fg='red').pack(padx=10, pady=10)
+        
+        # Actions
+        action_frame = tk.LabelFrame(parent, text="🛠️ Database Actions",
+                                    font=('Arial', 12, 'bold'),
+                                    bg=self.colors['dark'],
+                                    fg=self.colors['light'])
+        action_frame.pack(fill='x', padx=20, pady=10)
+        
+        tk.Button(action_frame, text="📋 View All Tables",
+                 command=self.view_all_tables,
+                 bg=self.colors['primary'], fg='white',
+                 padx=20, pady=5).pack(pady=10)
+    
+    def view_all_tables(self):
+        """View all database tables"""
+        tables = ['users', 'signed_documents', 'secure_messages', 'audit_log']
+        
+        for table in tables:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute(f'SELECT COUNT(*) FROM {table}')
+                count = cursor.fetchone()[0]
+                cursor.close()
+                
+                messagebox.showinfo(f"Table: {table}", 
+                                   f"Table: {table}\nTotal Records: {count}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to query {table}: {str(e)}")
     
     def create_audit_logs_tab(self, parent):
         """Create audit logs viewing interface"""
-        tk.Label(parent, text="Audit Logs",
-                font=('Arial', 16, 'bold'),
-                bg=self.colors['dark'], fg=self.colors['light']).pack(pady=20)
+        for widget in parent.winfo_children():
+            widget.destroy()
         
+        if not self.db_conn:
+            tk.Label(parent, text="❌ Database not connected",
+                    font=('Arial', 14),
+                    bg=self.colors['dark'], fg=self.colors['danger']).pack(pady=50)
+            return
+        
+        # Control panel
+        control_frame = tk.Frame(parent, bg=self.colors['dark'])
+        control_frame.pack(fill='x', padx=10, pady=10)
+        
+        tk.Button(control_frame, text="🔄 Refresh Logs",
+                 command=self.load_audit_logs,
+                 bg=self.colors['primary'], fg='white',
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(control_frame, text="📊 Export Logs",
+                 command=self.export_audit_logs,
+                 bg=self.colors['success'], fg='white',
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        tk.Button(control_frame, text="🗑️ Clear Old Logs",
+                 command=self.clear_audit_logs,
+                 bg=self.colors['danger'], fg='white',
+                 padx=15, pady=5).pack(side='left', padx=5)
+        
+        # Logs display
         logs_frame = tk.Frame(parent, bg=self.colors['dark'])
-        logs_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        logs_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         self.audit_logs_text = scrolledtext.ScrolledText(logs_frame,
                                                         width=100, height=20,
@@ -3306,10 +4354,7 @@ Status: ✅ Connected
                                                         bg='#2c3e50', fg='white')
         self.audit_logs_text.pack(fill='both', expand=True)
         
-        tk.Button(logs_frame, text="📋 Refresh Logs",
-                 command=self.load_audit_logs,
-                 bg=self.colors['primary'], fg='white').pack(pady=5)
-        
+        # Load logs
         self.load_audit_logs()
     
     def load_audit_logs(self, limit=100):
@@ -3334,7 +4379,7 @@ Status: ✅ Connected
             cursor.close()
             
             log_text = "📜 AUDIT LOGS (Last 100 entries)\n"
-            log_text += "="*80 + "\n\n"
+            log_text += "="*100 + "\n\n"
             
             for log in logs:
                 username, activity_type, description, timestamp, success = log
@@ -3347,6 +4392,59 @@ Status: ✅ Connected
         except Exception as e:
             self.audit_logs_text.delete("1.0", tk.END)
             self.audit_logs_text.insert("1.0", f"Error loading logs: {str(e)}")
+    
+    def export_audit_logs(self):
+        """Export audit logs to file"""
+        filename = filedialog.asksaveasfilename(
+            title="Export Audit Logs",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        
+        if filename:
+            try:
+                cursor = self.db_conn.cursor()
+                cursor.execute('''
+                    SELECT a.timestamp, u.username, a.activity_type, a.description, a.success
+                    FROM audit_log a
+                    JOIN users u ON a.user_id = u.id
+                    ORDER BY a.timestamp DESC
+                ''')
+                
+                with open(filename, 'w') as f:
+                    f.write("Timestamp,Username,Activity Type,Description,Success\n")
+                    for row in cursor.fetchall():
+                        f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
+                
+                cursor.close()
+                messagebox.showinfo("Success", f"Logs exported to {filename}")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export logs: {str(e)}")
+    
+    def clear_audit_logs(self):
+        """Clear old audit logs"""
+        result = messagebox.askyesno("Confirm Clear",
+                                    "Delete all audit logs older than 30 days?\n\n"
+                                    "This action cannot be undone!")
+        
+        if result:
+            try:
+                cursor = self.db_conn.cursor()
+                cutoff = datetime.now() - timedelta(days=30)
+                cursor.execute('DELETE FROM audit_log WHERE timestamp < %s', (cutoff,))
+                deleted = cursor.rowcount
+                self.db_conn.commit()
+                cursor.close()
+                
+                self.log_activity(self.current_user['id'], "ADMIN_ACTION",
+                                f"Cleared {deleted} old audit logs")
+                
+                messagebox.showinfo("Success", f"Deleted {deleted} old log entries")
+                self.load_audit_logs()
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to clear logs: {str(e)}")
     
     def create_certificate_tab(self):
         """Create certificate management tab"""
